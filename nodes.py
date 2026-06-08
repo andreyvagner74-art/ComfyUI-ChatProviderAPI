@@ -315,6 +315,12 @@ REVERSED_DIMENSION_PATTERN = re.compile(
     r"height\s*[=:]\s*\d+\s+width\s*[=:]\s*\d+",
     re.IGNORECASE,
 )
+PHOTO_STYLE_ALIASES = (
+    "photo_style",
+    "photography_style",
+    "image_style",
+    "style_photo",
+)
 
 
 def _image_tensor_to_data_url_and_size(image, batch_index=0):
@@ -376,6 +382,22 @@ def _build_user_prompt(user_prompt, system_prompt, width, height):
         if dimension_line.lower() not in prompt.lower():
             prompt = f"{dimension_line}\n\n{prompt}" if prompt else dimension_line
     return prompt
+
+
+def _resolve_prompt_dimensions(image_width, image_height, width, height):
+    try:
+        prompt_width = int(width)
+    except (TypeError, ValueError):
+        prompt_width = 0
+    try:
+        prompt_height = int(height)
+    except (TypeError, ValueError):
+        prompt_height = 0
+
+    return (
+        prompt_width if prompt_width > 0 else image_width,
+        prompt_height if prompt_height > 0 else image_height,
+    )
 
 
 def _join_url(base_url, path):
@@ -504,7 +526,11 @@ def _build_system_prompt(preset_name, custom_system_prompt, force_json):
     if custom_system_prompt.strip():
         parts.append(custom_system_prompt.strip())
     if force_json:
-        parts.append("Return only valid JSON. Do not wrap it in markdown code fences.")
+        parts.append(
+            "Return exactly one valid JSON object or array. Do not wrap it in markdown "
+            "code fences. Do not add explanations, comments, or trailing commas. Escape "
+            "all double quotes inside string values."
+        )
     return "\n\n".join(parts)
 
 
@@ -543,6 +569,527 @@ def _strip_markdown_code_fence(text):
     if match:
         return match.group(1).strip()
     return text
+
+
+def _next_non_ws(text, start):
+    index = start
+    while index < len(text) and text[index].isspace():
+        index += 1
+    return index
+
+
+def _json_quote_can_close(text, quote_index):
+    next_index = _next_non_ws(text, quote_index + 1)
+    if next_index >= len(text):
+        return True
+
+    next_char = text[next_index]
+    if next_char in ":}]":
+        return True
+    if next_char == ",":
+        after_comma = _next_non_ws(text, next_index + 1)
+        if after_comma >= len(text):
+            return False
+        value_start = text[after_comma]
+        if value_start in '"{[-0123456789]}':
+            return True
+        return bool(re.match(r"(?:true|false|null)\b", text[after_comma:]))
+    return False
+
+
+def _find_balanced_json_end(text, start):
+    stack = []
+    in_string = False
+    escape = False
+
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            stack.append("}")
+        elif char == "[":
+            stack.append("]")
+        elif char in "}]":
+            if not stack or char != stack[-1]:
+                return None
+            stack.pop()
+            if not stack:
+                return index + 1
+
+    return None
+
+
+def _json_candidate_from_start(text, start):
+    if start < 0 or start >= len(text) or text[start] not in "{[":
+        return None
+
+    end = _find_balanced_json_end(text, start)
+    if end is not None:
+        return text[start:end].strip()
+
+    closer = "}" if text[start] == "{" else "]"
+    last = text.rfind(closer)
+    if last > start:
+        return text[start:last + 1].strip()
+    return text[start:].strip()
+
+
+def _extract_json_candidate(text):
+    for match in re.finditer(r"```(?:json|JSON)?\s*([\s\S]*?)```", text):
+        candidate = match.group(1).strip()
+        if candidate[:1] in "{[":
+            return candidate, "fence"
+
+    stripped = _strip_markdown_code_fence(text).strip()
+    if stripped[:1] in "{[":
+        return _json_candidate_from_start(stripped, 0), "document"
+
+    starts = [index for index, char in enumerate(text) if char in "{["]
+    for start in starts:
+        candidate = _json_candidate_from_start(text, start)
+        if candidate:
+            return candidate, "embedded"
+
+    return None, None
+
+
+def _looks_like_json_response(text):
+    stripped = _strip_markdown_code_fence(text).strip()
+    if stripped[:1] in "{[":
+        return True
+    return bool(re.search(r"```(?:json|JSON)?\s*[\r\n]*\s*[{[]", text))
+
+
+def _strip_json_comments(text):
+    result = []
+    in_string = False
+    escape = False
+    index = 0
+
+    while index < len(text):
+        char = text[index]
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+
+        if in_string:
+            result.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+
+        if char == '"':
+            in_string = True
+            result.append(char)
+            index += 1
+        elif char == "/" and next_char == "/":
+            index += 2
+            while index < len(text) and text[index] not in "\r\n":
+                index += 1
+        elif char == "/" and next_char == "*":
+            index += 2
+            while index + 1 < len(text) and text[index:index + 2] != "*/":
+                index += 1
+            index = min(len(text), index + 2)
+        else:
+            result.append(char)
+            index += 1
+
+    return "".join(result)
+
+
+def _remove_trailing_json_commas(text):
+    result = []
+    in_string = False
+    escape = False
+    index = 0
+
+    while index < len(text):
+        char = text[index]
+
+        if in_string:
+            result.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+
+        if char == '"':
+            in_string = True
+            result.append(char)
+        elif char == ",":
+            next_index = _next_non_ws(text, index + 1)
+            if next_index >= len(text) or text[next_index] not in "}]":
+                result.append(char)
+        else:
+            result.append(char)
+        index += 1
+
+    return "".join(result)
+
+
+def _escape_json_string_chars(text):
+    result = []
+    in_string = False
+    escape = False
+
+    for index, char in enumerate(text):
+        if not in_string:
+            if char == '"':
+                in_string = True
+                escape = False
+            result.append(char)
+            continue
+
+        if escape:
+            result.append(char)
+            escape = False
+            continue
+
+        if char == "\\":
+            next_char = text[index + 1] if index + 1 < len(text) else ""
+            if next_char and next_char not in '"\\/bfnrtu':
+                result.append("\\\\")
+            else:
+                result.append(char)
+                escape = True
+            continue
+
+        if char == '"':
+            if _json_quote_can_close(text, index):
+                in_string = False
+                result.append(char)
+            else:
+                result.append('\\"')
+            continue
+
+        if char == "\n" or char == "\r":
+            result.append("\\n")
+        elif char == "\t":
+            result.append("\\t")
+        elif ord(char) < 32:
+            continue
+        else:
+            result.append(char)
+
+    if in_string:
+        result.append('"')
+    return "".join(result)
+
+
+def _quote_unquoted_json_keys(text):
+    return re.sub(
+        r'([,{]\s*)([A-Za-z_][A-Za-z0-9_-]*)\s*:',
+        r'\1"\2":',
+        text,
+    )
+
+
+def _replace_non_json_literals(text):
+    result = []
+    in_string = False
+    escape = False
+    index = 0
+    replacements = {"None": "null", "True": "true", "False": "false"}
+
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            result.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+
+        if char == '"':
+            in_string = True
+            result.append(char)
+            index += 1
+            continue
+
+        replaced = False
+        for old, new in replacements.items():
+            if text.startswith(old, index):
+                before = text[index - 1] if index > 0 else ""
+                after_index = index + len(old)
+                after = text[after_index] if after_index < len(text) else ""
+                if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+                    result.append(new)
+                    index = after_index
+                    replaced = True
+                    break
+        if replaced:
+            continue
+
+        result.append(char)
+        index += 1
+
+    return "".join(result)
+
+
+def _close_unbalanced_json(text):
+    result = []
+    stack = []
+    in_string = False
+    escape = False
+
+    for char in text:
+        if in_string:
+            result.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            result.append(char)
+        elif char == "{":
+            stack.append("}")
+            result.append(char)
+        elif char == "[":
+            stack.append("]")
+            result.append(char)
+        elif char in "}]":
+            if stack and stack[-1] == char:
+                stack.pop()
+                result.append(char)
+        else:
+            result.append(char)
+
+    return "".join(result) + "".join(reversed(stack))
+
+
+def _normalize_json_repair_text(text):
+    return (
+        text.strip()
+        .lstrip("\ufeff")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u201e", '"')
+        .replace("\u00ab", '"')
+        .replace("\u00bb", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
+
+
+def _json_repair_attempts(candidate):
+    attempts = []
+
+    def add(value):
+        value = value.strip()
+        if value and value not in attempts:
+            attempts.append(value)
+
+    base = _normalize_json_repair_text(candidate)
+    add(base)
+
+    no_comments = _strip_json_comments(base)
+    add(no_comments)
+
+    no_trailing_commas = _remove_trailing_json_commas(no_comments)
+    add(no_trailing_commas)
+
+    quoted_keys = _quote_unquoted_json_keys(no_trailing_commas)
+    add(quoted_keys)
+
+    json_literals = _replace_non_json_literals(quoted_keys)
+    add(json_literals)
+
+    escaped_strings = _escape_json_string_chars(json_literals)
+    add(escaped_strings)
+
+    closed = _close_unbalanced_json(escaped_strings)
+    add(closed)
+
+    add(_remove_trailing_json_commas(closed))
+    return attempts
+
+
+def _parse_json_with_repair(candidate):
+    last_error = None
+    for attempt in _json_repair_attempts(candidate):
+        try:
+            return json.loads(attempt), attempt, last_error
+        except json.JSONDecodeError as exc:
+            last_error = exc
+    return None, None, last_error
+
+
+def _normalize_hex_color(value):
+    if not isinstance(value, str):
+        return None
+    color = value.strip()
+    if re.fullmatch(r"#?[0-9a-fA-F]{6}", color):
+        return "#" + color.lstrip("#").upper()
+    if re.fullmatch(r"#?[0-9a-fA-F]{3}", color):
+        short = color.lstrip("#")
+        return "#" + "".join(char * 2 for char in short).upper()
+    return None
+
+
+def _clean_color_palette(palette, limit=None):
+    if isinstance(palette, dict):
+        palette = palette.values()
+    if not isinstance(palette, (list, tuple)):
+        return []
+
+    colors = []
+    for item in palette:
+        color = _normalize_hex_color(item)
+        if color:
+            colors.append(color)
+            if limit and len(colors) >= limit:
+                break
+    return colors
+
+
+def _normalize_bbox(value):
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        ymin, xmin, ymax, xmax = [max(0, min(1000, round(float(v)))) for v in value]
+    except (TypeError, ValueError):
+        return None
+    if ymin > ymax:
+        ymin, ymax = ymax, ymin
+    if xmin > xmax:
+        xmin, xmax = xmax, xmin
+    return [ymin, xmin, ymax, xmax]
+
+
+def _normalize_ideogram_caption(value):
+    if not isinstance(value, dict) or "compositional_deconstruction" not in value:
+        return value
+
+    normalized = {}
+    if "high_level_description" in value:
+        normalized["high_level_description"] = str(value.get("high_level_description") or "")
+
+    style = value.get("style_description")
+    if isinstance(style, dict):
+        normalized_style = {}
+        if "aesthetics" in style:
+            normalized_style["aesthetics"] = str(style.get("aesthetics") or "")
+        if "lighting" in style:
+            normalized_style["lighting"] = str(style.get("lighting") or "")
+
+        photo = style.get("photo")
+        if photo is None:
+            for alias in PHOTO_STYLE_ALIASES:
+                if style.get(alias) is not None:
+                    photo = style.get(alias)
+                    print(
+                        "[ComfyUI-ChatProviderAPI] Renamed style_description."
+                        f"{alias} to style_description.photo for Ideogram KJ import."
+                    )
+                    break
+
+        medium = str(style.get("medium") or "")
+        if photo is not None and ("art_style" not in style or medium.lower() == "photograph"):
+            normalized_style["photo"] = str(photo)
+        elif style.get("art_style") is not None:
+            normalized_style["art_style"] = str(style.get("art_style") or "")
+        elif photo is not None:
+            normalized_style["photo"] = str(photo)
+
+        if "medium" in style:
+            normalized_style["medium"] = medium
+        palette = _clean_color_palette(style.get("color_palette"), limit=16)
+        if palette:
+            normalized_style["color_palette"] = palette
+        normalized["style_description"] = normalized_style
+
+    decomposition = value.get("compositional_deconstruction")
+    if isinstance(decomposition, dict):
+        normalized_decomposition = {
+            "background": str(decomposition.get("background") or ""),
+            "elements": [],
+        }
+        elements = decomposition.get("elements")
+        if isinstance(elements, list):
+            for element in elements:
+                if not isinstance(element, dict):
+                    continue
+                element_type = "text" if element.get("type") == "text" else "obj"
+                normalized_element = {"type": element_type}
+                bbox = _normalize_bbox(element.get("bbox"))
+                if bbox:
+                    normalized_element["bbox"] = bbox
+                if element_type == "text":
+                    normalized_element["text"] = str(element.get("text") or "")
+                normalized_element["desc"] = str(element.get("desc") or "")
+                palette = _clean_color_palette(element.get("color_palette"), limit=5)
+                if palette:
+                    normalized_element["color_palette"] = palette
+                normalized_decomposition["elements"].append(normalized_element)
+        normalized["compositional_deconstruction"] = normalized_decomposition
+
+    return normalized
+
+
+def _postprocess_json_response(text, expect_json=False):
+    if not text:
+        return text
+
+    candidate, source = _extract_json_candidate(text)
+    if not candidate:
+        if expect_json:
+            print("[ComfyUI-ChatProviderAPI] WARNING: expected JSON output, but no JSON block was found.")
+        return _strip_markdown_code_fence(text).strip()
+
+    should_process = expect_json or source in {"fence", "document"} or _looks_like_json_response(text)
+    if not should_process:
+        return text
+
+    try:
+        parsed = json.loads(candidate)
+        repaired = False
+    except json.JSONDecodeError:
+        parsed, repaired_text, repair_error = _parse_json_with_repair(candidate)
+        if parsed is None:
+            if expect_json:
+                details = f" at char {repair_error.pos}: {repair_error.msg}" if repair_error else ""
+                raise RuntimeError(
+                    "ChatProvider returned JSON-like text, but automatic JSON repair failed"
+                    f"{details}. Response starts with: {candidate[:500]}"
+                ) from repair_error
+            return text
+        candidate = repaired_text
+        repaired = True
+
+    normalized = _normalize_ideogram_caption(parsed)
+    result = json.dumps(normalized, ensure_ascii=False, indent=2)
+    if repaired:
+        print("[ComfyUI-ChatProviderAPI] Repaired invalid JSON model output.")
+    elif candidate.strip() != _strip_markdown_code_fence(text).strip():
+        print("[ComfyUI-ChatProviderAPI] Extracted JSON from model output wrapper text.")
+    return result
 
 
 def _get_finish_reason(response):
@@ -647,6 +1194,26 @@ class ChatProviderGoogleAIVision:
         return {
             "required": {
                 "image": ("IMAGE",),
+                "width": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 16384,
+                        "step": 16,
+                        "tooltip": "Prompt/canvas width override. 0 = use the input image width. Convert to input to connect externally.",
+                    },
+                ),
+                "height": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 16384,
+                        "step": 16,
+                        "tooltip": "Prompt/canvas height override. 0 = use the input image height. Convert to input to connect externally.",
+                    },
+                ),
                 "api_key": (
                     "STRING",
                     {
@@ -717,6 +1284,8 @@ class ChatProviderGoogleAIVision:
     def run(
         self,
         image,
+        width,
+        height,
         api_key,
         endpoint,
         model,
@@ -757,13 +1326,19 @@ class ChatProviderGoogleAIVision:
             image,
             batch_index=batch_index,
         )
+        prompt_width, prompt_height = _resolve_prompt_dimensions(
+            image_width,
+            image_height,
+            width,
+            height,
+        )
         system_prompt = _build_system_prompt(system_preset, custom_system_prompt, force_json)
-        system_prompt = _apply_image_dimensions(system_prompt, image_width, image_height)
+        system_prompt = _apply_image_dimensions(system_prompt, prompt_width, prompt_height)
         user_prompt_sent = _build_user_prompt(
             user_prompt,
             system_prompt,
-            image_width,
-            image_height,
+            prompt_width,
+            prompt_height,
         )
         effective_max_tokens = _effective_max_tokens(
             max_tokens,
@@ -821,6 +1396,8 @@ class ChatProviderGoogleAIVision:
                 "batch_index": int(batch_index),
                 "width": image_width,
                 "height": image_height,
+                "prompt_width": prompt_width,
+                "prompt_height": prompt_height,
                 "detail": image_detail,
                 "data_url_chars": len(image_url),
             },
@@ -854,6 +1431,10 @@ class ChatProviderGoogleAIVision:
         )
 
         text = _strip_markdown_code_fence(_extract_text(response))
+        text = _postprocess_json_response(
+            text,
+            expect_json=_needs_large_json_budget(system_preset, system_prompt, force_json),
+        )
         _debug_log_response(response, text)
         if not text.strip():
             text = _build_empty_response_message(response)
