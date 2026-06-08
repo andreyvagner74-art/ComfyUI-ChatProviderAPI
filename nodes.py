@@ -537,6 +537,14 @@ def _extract_text(response):
     return json.dumps(response, ensure_ascii=False)
 
 
+def _strip_markdown_code_fence(text):
+    stripped = text.strip()
+    match = re.fullmatch(r"```(?:json|JSON)?\s*\n?([\s\S]*?)\n?```", stripped)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
 def _get_finish_reason(response):
     if not isinstance(response, dict):
         return None
@@ -845,7 +853,7 @@ class ChatProviderGoogleAIVision:
             retries=int(retries),
         )
 
-        text = _extract_text(response)
+        text = _strip_markdown_code_fence(_extract_text(response))
         _debug_log_response(response, text)
         if not text.strip():
             text = _build_empty_response_message(response)
