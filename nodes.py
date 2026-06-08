@@ -48,7 +48,40 @@ FALLBACK_MODELS = [
 
 
 class TransientChatProviderError(RuntimeError):
-    pass
+    def __init__(self, message, status_code=None, retry_after=None, body=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.body = body
+
+
+def _parse_error_body(body):
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        return body.strip(), None
+
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(error, dict):
+        return error.get("message") or body.strip(), error.get("type")
+    return body.strip(), None
+
+
+def _extract_retry_after(headers, message):
+    retry_after = None
+    try:
+        value = headers.get("Retry-After")
+        if value is not None:
+            retry_after = int(float(value))
+    except Exception:
+        retry_after = None
+
+    if retry_after is None:
+        match = re.search(r"try again in\s+(\d+)\s+seconds?", message or "", re.I)
+        if match:
+            retry_after = int(match.group(1))
+
+    return retry_after
 
 
 def _read_response_text(response):
@@ -145,9 +178,22 @@ def _http_json(method, url, headers=None, payload=None, timeout=30):
                 raw = _read_response_text(response)
     except urllib.error.HTTPError as exc:
         body = _read_response_text(exc)
+        message, error_type = _parse_error_body(body)
+        retry_after = _extract_retry_after(exc.headers, message)
         if exc.code == 429 or exc.code >= 500:
-            raise TransientChatProviderError(f"ChatProvider HTTP {exc.code}: {body}") from exc
-        raise RuntimeError(f"ChatProvider HTTP {exc.code}: {body}") from exc
+            details = f"ChatProvider HTTP {exc.code}: {message}"
+            if error_type:
+                details += f" ({error_type})"
+            raise TransientChatProviderError(
+                details,
+                status_code=exc.code,
+                retry_after=retry_after,
+                body=body,
+            ) from exc
+        details = f"ChatProvider HTTP {exc.code}: {message}"
+        if error_type:
+            details += f" ({error_type})"
+        raise RuntimeError(details) from exc
     except urllib.error.URLError as exc:
         raise TransientChatProviderError(f"ChatProvider request failed: {exc.reason}") from exc
     except TimeoutError as exc:
@@ -181,14 +227,15 @@ def _http_json_with_retry(method, url, headers=None, payload=None, timeout=30, r
             last_error = exc
             if attempt >= max_attempts:
                 break
-            delay = min(2.0 * attempt, 5.0)
+            delay = exc.retry_after if exc.retry_after is not None else min(2.0 * attempt, 5.0)
+            delay = max(0.5, min(float(delay), 30.0))
             print(
                 "[ComfyUI-ChatProviderAPI] Transient ChatProvider error: "
                 f"{exc}. Retrying in {delay:.1f}s."
             )
             time.sleep(delay)
 
-    raise last_error
+    raise RuntimeError(str(last_error)) from last_error
 
 
 def _load_google_models():
@@ -511,6 +558,45 @@ def _get_usage(response):
     return response.get("usage") or response.get("usageMetadata")
 
 
+def _get_safety_info(response):
+    if not isinstance(response, dict):
+        return None
+
+    info = {}
+    if response.get("promptFeedback"):
+        info["promptFeedback"] = response.get("promptFeedback")
+
+    candidates = response.get("candidates")
+    if candidates:
+        candidate = candidates[0]
+        for key in ("finishReason", "safetyRatings", "citationMetadata"):
+            if candidate.get(key) is not None:
+                info[key] = candidate.get(key)
+
+    choices = response.get("choices")
+    if choices:
+        choice = choices[0]
+        for key in ("finish_reason", "content_filter_results", "safetyRatings"):
+            if choice.get(key) is not None:
+                info[key] = choice.get(key)
+
+    return info or None
+
+
+def _build_empty_response_message(response):
+    diagnostics = {
+        "finish_reason": _get_finish_reason(response),
+        "usage": _get_usage(response),
+        "safety": _get_safety_info(response),
+    }
+    return (
+        "Gemini returned an empty response. Possible reasons: safety/censorship "
+        "filter, blocked content, model refusal, unsupported model behavior, or an "
+        "upstream provider issue.\n\nDiagnostics:\n"
+        + json.dumps(diagnostics, ensure_ascii=False, indent=2)
+    )
+
+
 def _debug_log_response(response, text):
     finish_reason = _get_finish_reason(response)
     debug = {
@@ -761,6 +847,9 @@ class ChatProviderGoogleAIVision:
 
         text = _extract_text(response)
         _debug_log_response(response, text)
+        if not text.strip():
+            text = _build_empty_response_message(response)
+            print("[ComfyUI-ChatProviderAPI] WARNING: Gemini returned an empty response.")
         return (text,)
 
 
