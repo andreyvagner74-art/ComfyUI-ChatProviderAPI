@@ -400,6 +400,25 @@ def _resolve_prompt_dimensions(image_width, image_height, width, height):
     )
 
 
+def _append_multi_image_context(
+    prompt,
+    image_1_width,
+    image_1_height,
+    image_2_width,
+    image_2_height,
+):
+    if image_2_width is None or image_2_height is None:
+        return prompt
+
+    context = (
+        f"Image 1 dimensions: width={image_1_width} height={image_1_height}\n"
+        f"Image 2 dimensions: width={image_2_width} height={image_2_height}\n"
+        "Image 1 is the first visual reference. Image 2 is the second visual reference. "
+        "If the user asks for a character on a background, treat Image 1 as the character/subject reference and Image 2 as the background/context reference."
+    )
+    return f"{prompt}\n\n{context}" if prompt else context
+
+
 def _join_url(base_url, path):
     normalized = (base_url or DEFAULT_BASE_URL).strip().rstrip("/")
     if normalized.endswith("/api"):
@@ -1193,7 +1212,6 @@ class ChatProviderGoogleAIVision:
         presets = _load_presets()
         return {
             "required": {
-                "image": ("IMAGE",),
                 "width": (
                     "INT",
                     {
@@ -1240,7 +1258,7 @@ class ChatProviderGoogleAIVision:
                 ),
                 "temperature": (
                     "FLOAT",
-                    {"default": 0.2, "min": 0.0, "max": 2.0, "step": 0.05},
+                    {"default": 0.5, "min": 0.0, "max": 2.0, "step": 0.05},
                 ),
                 "top_p": (
                     "FLOAT",
@@ -1250,30 +1268,23 @@ class ChatProviderGoogleAIVision:
                     "INT",
                     {"default": 4096, "min": 1, "max": 32000, "step": 1},
                 ),
-                "seed": (
-                    "INT",
-                    {"default": -1, "min": -1, "max": 2147483647, "step": 1},
-                ),
-                "batch_index": (
-                    "INT",
-                    {"default": 0, "min": 0, "max": 4096, "step": 1},
-                ),
-                "image_detail": (["auto", "low", "high"],),
-                "force_json": ("BOOLEAN", {"default": False}),
-                "timeout_seconds": (
-                    "INT",
-                    {"default": 300, "min": 5, "max": 900, "step": 5},
-                ),
-                "cache_buster": (
-                    "INT",
-                    {"default": 0, "min": 0, "max": 2147483647, "step": 1},
-                ),
-                "stream": ("BOOLEAN", {"default": True}),
                 "retries": (
                     "INT",
                     {"default": 1, "min": 0, "max": 5, "step": 1},
                 ),
-            }
+                "assistant_prompt_enabled": ("BOOLEAN", {"default": False}),
+                "assistant_prompt": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                    },
+                ),
+            },
+            "optional": {
+                "image": ("IMAGE",),
+                "image_2": ("IMAGE",),
+            },
         }
 
     RETURN_TYPES = ("STRING",)
@@ -1281,9 +1292,12 @@ class ChatProviderGoogleAIVision:
     FUNCTION = "run"
     CATEGORY = "ChatProviderAPI"
 
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        return time.time()
+
     def run(
         self,
-        image,
         width,
         height,
         api_key,
@@ -1295,15 +1309,19 @@ class ChatProviderGoogleAIVision:
         temperature,
         top_p,
         max_tokens,
-        seed,
-        batch_index,
-        image_detail,
-        force_json,
-        timeout_seconds,
-        cache_buster,
-        stream=True,
-        retries=1,
+        retries,
+        assistant_prompt_enabled=False,
+        assistant_prompt="",
+        timeout_seconds=60,
+        seed=-1,
+        batch_index=0,
+        image_detail="auto",
+        force_json=False,
+        cache_buster=0,
+        stream=False,
         base_url=DEFAULT_BASE_URL,
+        image=None,
+        image_2=None,
     ):
         del cache_buster
 
@@ -1322,13 +1340,28 @@ class ChatProviderGoogleAIVision:
         if path.startswith("/google-ai/") and model_for_request.startswith("google-ai/"):
             model_for_request = model_for_request.split("/", 1)[1]
 
-        image_url, image_width, image_height = _image_tensor_to_data_url_and_size(
-            image,
-            batch_index=batch_index,
-        )
+        image_url = None
+        image_width = None
+        image_height = None
+        if image is not None:
+            image_url, image_width, image_height = _image_tensor_to_data_url_and_size(
+                image,
+                batch_index=batch_index,
+            )
+        image_2_url = None
+        image_2_width = None
+        image_2_height = None
+        if image_2 is not None:
+            image_2_url, image_2_width, image_2_height = _image_tensor_to_data_url_and_size(
+                image_2,
+                batch_index=batch_index,
+            )
+
+        dimension_source_width = image_2_width or image_width or 1024
+        dimension_source_height = image_2_height or image_height or 1024
         prompt_width, prompt_height = _resolve_prompt_dimensions(
-            image_width,
-            image_height,
+            dimension_source_width,
+            dimension_source_height,
             width,
             height,
         )
@@ -1340,6 +1373,14 @@ class ChatProviderGoogleAIVision:
             prompt_width,
             prompt_height,
         )
+        if image_url is not None and image_2_url is not None:
+            user_prompt_sent = _append_multi_image_context(
+                user_prompt_sent,
+                image_width,
+                image_height,
+                image_2_width,
+                image_2_height,
+            )
         effective_max_tokens = _effective_max_tokens(
             max_tokens,
             system_preset,
@@ -1347,21 +1388,45 @@ class ChatProviderGoogleAIVision:
             force_json,
         )
 
+        image_content = []
+        if user_prompt_sent:
+            image_content.append({"type": "text", "text": user_prompt_sent})
+        if image_url is not None and image_2_url is not None:
+            image_content.append({
+                "type": "text",
+                "text": "Image 1 (first reference; often subject/character):",
+            })
+        if image_url is not None:
+            image_content.append({
+                "type": "image_url",
+                "image_url": {"url": image_url, "detail": image_detail},
+            })
+        if image_2_url is not None:
+            image_content.extend([
+                {
+                    "type": "text",
+                    "text": "Image 2 (second reference; often background/context):" if image_url is not None else "Image 1 (visual reference):",
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_2_url, "detail": image_detail},
+                },
+            ])
+        if not image_content:
+            image_content.append({"type": "text", "text": "Generate the requested prompt."})
+
+        assistant_prompt_sent = (assistant_prompt or "").strip() if assistant_prompt_enabled else ""
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append(
             {
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": user_prompt_sent},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": image_url, "detail": image_detail},
-                    },
-                ],
+                "content": image_content,
             }
         )
+        if assistant_prompt_sent:
+            messages.append({"role": "assistant", "content": assistant_prompt_sent})
 
         payload = {
             "model": model_for_request,
@@ -1391,6 +1456,8 @@ class ChatProviderGoogleAIVision:
             "resolved_system_prompt": system_prompt,
             "user_prompt": user_prompt,
             "user_prompt_sent": user_prompt_sent,
+            "assistant_prompt_enabled": bool(assistant_prompt_enabled),
+            "assistant_prompt_sent": assistant_prompt_sent,
             "stream": bool(stream),
             "image": {
                 "batch_index": int(batch_index),
@@ -1399,8 +1466,16 @@ class ChatProviderGoogleAIVision:
                 "prompt_width": prompt_width,
                 "prompt_height": prompt_height,
                 "detail": image_detail,
-                "data_url_chars": len(image_url),
+                "data_url_chars": len(image_url) if image_url is not None else 0,
+            } if image_url is not None else None,
+            "image_2": None if image_2_url is None else {
+                "batch_index": int(batch_index),
+                "width": image_2_width,
+                "height": image_2_height,
+                "detail": image_detail,
+                "data_url_chars": len(image_2_url),
             },
+            "image_count": int(image_url is not None) + int(image_2_url is not None),
             "generation": {
                 "temperature": float(temperature),
                 "top_p": float(top_p),
